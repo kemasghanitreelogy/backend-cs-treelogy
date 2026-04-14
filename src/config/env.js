@@ -1,7 +1,8 @@
 const dotenv = require('dotenv');
 const path = require('path');
 
-dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+// Load .env for local development; on Vercel, env vars are injected directly
+dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
 const required = [
   'HF_API_TOKEN',
