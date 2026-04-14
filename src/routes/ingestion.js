@@ -4,6 +4,8 @@ const path = require('path');
 const {
   handleFileIngest,
   handleDirectoryIngest,
+  handleListDocuments,
+  handleDeleteDocument,
   handleClearStore,
 } = require('../controllers/ingestionController');
 const { validateFileUpload } = require('../middleware/validator');
@@ -35,7 +37,13 @@ router.post('/file', ingestionLimiter, upload.single('document'), validateFileUp
 // Ingest all documents from data/documents/
 router.post('/directory', ingestionLimiter, handleDirectoryIngest);
 
-// Clear vector store
+// List all knowledge base documents + stats
+router.get('/documents', handleListDocuments);
+
+// Delete a single document by ID
+router.delete('/documents/:id', handleDeleteDocument);
+
+// Clear entire knowledge store
 router.delete('/', handleClearStore);
 
 module.exports = router;

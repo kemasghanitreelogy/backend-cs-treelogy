@@ -1,5 +1,5 @@
 const { processQuery, processQueryStream } = require('../services/ragOrchestrator');
-const { getCachedAnswer, cacheAnswer } = require('../services/cacheService');
+const { getCachedAnswer, cacheAnswer, getPopularQuestions } = require('../services/cacheService');
 const { logInteraction } = require('../services/auditLogger');
 
 /**
@@ -75,4 +75,19 @@ async function handleStreamQuery(req, res) {
   }
 }
 
-module.exports = { handleQuery, handleStreamQuery };
+/**
+ * GET /api/query/popular
+ * Auto-generated FAQ from most frequently asked verified questions.
+ */
+async function handlePopularQuestions(req, res) {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const data = await getPopularQuestions(limit);
+    res.json({ questions: data, count: data.length });
+  } catch (err) {
+    console.error('[QueryController] Popular questions error:', err);
+    res.status(500).json({ error: 'Failed to fetch popular questions.' });
+  }
+}
+
+module.exports = { handleQuery, handleStreamQuery, handlePopularQuestions };
