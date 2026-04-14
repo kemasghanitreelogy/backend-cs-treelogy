@@ -1,5 +1,5 @@
 const supabase = require('../config/supabase');
-const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 
 const TABLE_NAME = 'audit_logs';
 
@@ -17,7 +17,7 @@ async function logInteraction({
   responseTimeMs,
 }) {
   const entry = {
-    id: uuidv4(),
+    id: crypto.randomUUID(),
     question,
     answer: typeof answer === 'string' ? answer.slice(0, 10000) : '',
     source_type: sourceType,

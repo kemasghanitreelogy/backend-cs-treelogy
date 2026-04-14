@@ -1,6 +1,12 @@
 const fs = require('fs');
 const path = require('path');
-const pdfParse = require('pdf-parse');
+
+// Lazy-load pdf-parse to avoid DOMMatrix crash in serverless environments
+let pdfParse;
+function getPdfParse() {
+  if (!pdfParse) pdfParse = require('pdf-parse');
+  return pdfParse;
+}
 
 /**
  * Load and parse a PDF file, returning structured text with metadata.
@@ -8,7 +14,7 @@ const pdfParse = require('pdf-parse');
 async function loadPDF(filePath) {
   const absolutePath = path.resolve(filePath);
   const buffer = fs.readFileSync(absolutePath);
-  const data = await pdfParse(buffer);
+  const data = await getPdfParse()(buffer);
 
   return {
     text: data.text,

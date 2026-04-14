@@ -11,9 +11,9 @@ const { ingestionLimiter } = require('../middleware/rateLimiter');
 
 const router = Router();
 
-// Configure multer for PDF uploads
+// Configure multer for PDF uploads — use /tmp on serverless (read-only filesystem)
 const upload = multer({
-  dest: path.resolve(__dirname, '../../data/uploads/'),
+  dest: path.join(require('os').tmpdir(), 'treelogy-uploads'),
   limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/pdf') {

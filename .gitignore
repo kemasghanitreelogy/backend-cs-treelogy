@@ -5,3 +5,4 @@ data/documents/*.pdf
 dist/
 .DS_Store
 *.tgz
+.vercel
