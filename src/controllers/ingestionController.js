@@ -1,27 +1,36 @@
 const fs = require('fs');
 const path = require('path');
-const { loadPDF, loadDirectory } = require('../services/documentLoader');
+const { loadDocument, loadDirectory } = require('../services/documentLoader');
 const { semanticChunk } = require('../services/chunker');
 const { storeChunks, clearStore } = require('../services/vectorStore');
 
 /**
  * POST /api/ingest/file
- * Ingest a single uploaded PDF into the vector store.
+ * Ingest a single uploaded document (PDF or DOCX) into the vector store.
  */
 async function handleFileIngest(req, res) {
   try {
     const filePath = req.file.path;
-    const document = await loadPDF(filePath);
+
+    // Determine original extension from the uploaded filename
+    const originalExt = path.extname(req.file.originalname).toLowerCase();
+    const targetPath = filePath + originalExt;
+
+    // Rename temp file to include extension so the loader can detect type
+    fs.renameSync(filePath, targetPath);
+
+    const document = await loadDocument(targetPath);
     const chunks = semanticChunk(document.text, document.metadata);
     const stored = await storeChunks(chunks);
 
     // Clean up the temp upload
-    fs.unlinkSync(filePath);
+    fs.unlinkSync(targetPath);
 
     res.json({
       message: `Successfully ingested "${document.metadata.name}"`,
       chunks: stored,
-      pages: document.metadata.pages,
+      type: document.metadata.type,
+      pages: document.metadata.pages || null,
     });
   } catch (err) {
     console.error('[IngestionController] File error:', err);
@@ -31,7 +40,7 @@ async function handleFileIngest(req, res) {
 
 /**
  * POST /api/ingest/directory
- * Ingest all PDFs from the data/documents directory.
+ * Ingest all documents (PDF + DOCX) from the data/documents directory.
  */
 async function handleDirectoryIngest(req, res) {
   try {
@@ -44,7 +53,7 @@ async function handleDirectoryIngest(req, res) {
     const documents = await loadDirectory(dirPath);
 
     if (documents.length === 0) {
-      return res.status(404).json({ error: 'No PDF files found in documents directory.' });
+      return res.status(404).json({ error: 'No supported documents (PDF/DOCX) found in documents directory.' });
     }
 
     let totalChunks = 0;
@@ -56,8 +65,9 @@ async function handleDirectoryIngest(req, res) {
       totalChunks += stored;
       results.push({
         file: doc.metadata.name,
+        type: doc.metadata.type,
         chunks: stored,
-        pages: doc.metadata.pages,
+        pages: doc.metadata.pages || null,
       });
     }
 

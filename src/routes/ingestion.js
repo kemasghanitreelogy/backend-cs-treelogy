@@ -11,23 +11,28 @@ const { ingestionLimiter } = require('../middleware/rateLimiter');
 
 const router = Router();
 
-// Configure multer for PDF uploads — use /tmp on serverless (read-only filesystem)
+const ALLOWED_MIMETYPES = [
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+];
+
+// Configure multer for document uploads (PDF + DOCX) — use /tmp on serverless
 const upload = multer({
   dest: path.join(require('os').tmpdir(), 'treelogy-uploads'),
   limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
   fileFilter: (req, file, cb) => {
-    if (file.mimetype === 'application/pdf') {
+    if (ALLOWED_MIMETYPES.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Only PDF files are accepted.'));
+      cb(new Error('Only PDF and DOCX files are accepted.'));
     }
   },
 });
 
-// Upload and ingest a single PDF
+// Upload and ingest a single document (PDF or DOCX)
 router.post('/file', ingestionLimiter, upload.single('document'), validateFileUpload, handleFileIngest);
 
-// Ingest all PDFs from data/documents/
+// Ingest all documents from data/documents/
 router.post('/directory', ingestionLimiter, handleDirectoryIngest);
 
 // Clear vector store

@@ -2,6 +2,11 @@
  * Request validation middleware.
  */
 
+const ALLOWED_MIMETYPES = [
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+];
+
 function validateQuestion(req, res, next) {
   const { question } = req.body;
 
@@ -23,11 +28,11 @@ function validateQuestion(req, res, next) {
 
 function validateFileUpload(req, res, next) {
   if (!req.file) {
-    return res.status(400).json({ error: 'A PDF file is required.' });
+    return res.status(400).json({ error: 'A PDF or DOCX file is required.' });
   }
 
-  if (req.file.mimetype !== 'application/pdf') {
-    return res.status(400).json({ error: 'Only PDF files are accepted.' });
+  if (!ALLOWED_MIMETYPES.includes(req.file.mimetype)) {
+    return res.status(400).json({ error: 'Only PDF and DOCX files are accepted.' });
   }
 
   // 20MB limit
