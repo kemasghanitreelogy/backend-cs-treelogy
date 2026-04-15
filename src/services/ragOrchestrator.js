@@ -11,9 +11,49 @@ const {
 } = require('../prompts/wellness');
 
 // Thresholds
-const FAQ_RELEVANCE_THRESHOLD = 15;    // Minimum FAQ relevance score to be considered a match
-const VECTOR_SIMILARITY_THRESHOLD = 0.65; // Lowered to catch more document matches
-const HIGH_CONFIDENCE_FAQ = 30;         // FAQ score above this = very confident match
+const FAQ_RELEVANCE_THRESHOLD = 15;          // Minimum FAQ relevance score to be considered a match
+const VECTOR_SIMILARITY_THRESHOLD = 0.62;    // Hard floor for docs-only answers
+const DOC_SUPPLEMENT_THRESHOLD = 0.50;       // Looser floor for docs used as supplement to FAQ
+const HIGH_CONFIDENCE_FAQ = 30;              // FAQ score above this = very confident match
+const DEEP_SEARCH_TOP_K = 8;                 // Per-query top-k for document retrieval
+const DEEP_SEARCH_FINAL_K = 6;               // Final chunks after dedupe + rerank
+
+/**
+ * Deep document search:
+ *  - Runs the original question
+ *  - Plus rewrites derived from top FAQ hits (expands vocabulary the uploaded docs may use)
+ *  - Merges, dedupes by content hash, and keeps the highest-similarity chunks
+ *
+ * This surfaces uploaded-file knowledge that a single-query search would miss.
+ */
+async function deepDocumentSearch(question, faqResults = []) {
+  const queries = new Set([question]);
+
+  // Expand with the top-2 FAQ questions (proven relevant phrasings)
+  faqResults.slice(0, 2).forEach((f) => {
+    if (f.question_id) queries.add(f.question_id);
+    if (f.question_en) queries.add(f.question_en);
+  });
+
+  const searches = await Promise.all(
+    [...queries].map((q) => searchSimilar(q, DEEP_SEARCH_TOP_K).catch(() => []))
+  );
+
+  const byKey = new Map();
+  for (const batch of searches) {
+    for (const hit of batch) {
+      const key = (hit.content || '').slice(0, 200);
+      const existing = byKey.get(key);
+      if (!existing || hit.similarity > existing.similarity) {
+        byKey.set(key, hit);
+      }
+    }
+  }
+
+  return [...byKey.values()]
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, DEEP_SEARCH_FINAL_K);
+}
 
 const MEDICAL_DISCLAIMER_ID = `\n\n---\n**Disclaimer:** Informasi ini diberikan hanya untuk tujuan edukasi dan kesehatan umum, bukan merupakan saran medis. Selalu konsultasikan dengan tenaga kesehatan profesional sebelum mengambil keputusan kesehatan. Treelogy tidak mendiagnosis, mengobati, atau menyembuhkan kondisi medis apa pun.`;
 const MEDICAL_DISCLAIMER_EN = `\n\n---\n**Disclaimer:** This information is provided for educational and wellness purposes only and does not constitute medical advice. Always consult a qualified healthcare professional before making health decisions. Treelogy does not diagnose, treat, or cure any medical condition.`;
@@ -40,8 +80,8 @@ async function processQuery(question) {
   const faqResults = await searchFaq(question, 5);
   const bestFaqScore = faqResults.length > 0 ? faqResults[0].relevanceScore : 0;
 
-  // === TIER 2: Document Vector Search (run in parallel with FAQ) ===
-  const documentResults = await searchSimilar(question, 5);
+  // === TIER 2: Deep Document Retrieval (query-expanded, deduped, re-ranked) ===
+  const documentResults = await deepDocumentSearch(question, faqResults);
   const bestDocScore = documentResults.length > 0 ? documentResults[0].similarity : 0;
 
   let prompt;
@@ -51,16 +91,30 @@ async function processQuery(question) {
   let confidence;
 
   // --- Decision Logic ---
+  // Always layer uploaded documents AFTER FAQ when they clear the supplement bar.
 
-  if (bestFaqScore >= HIGH_CONFIDENCE_FAQ) {
-    // HIGH CONFIDENCE FAQ: FAQ alone is sufficient
+  if (bestFaqScore >= HIGH_CONFIDENCE_FAQ && bestDocScore >= DOC_SUPPLEMENT_THRESHOLD) {
+    // HIGH CONFIDENCE FAQ + supporting docs: layered depth
+    const docContext = documentResults.map((r) => r.content);
+    const docSources = documentResults.map((r) => r.metadata);
+    prompt = buildLayeredPrompt(question, faqResults, docContext, docSources, language);
+    sourceType = 'faq+documents';
+    sources = [
+      ...faqResults.map((f) => ({ name: 'Treelogy FAQ', type: 'faq', category: f.category })),
+      ...docSources.map((s) => ({ name: s.name, type: 'document', path: s.path })),
+    ];
+    allContext = [...faqResults.map((f) => f.content), ...docContext];
+    confidence = Math.max(bestFaqScore / 100, bestDocScore);
+
+  } else if (bestFaqScore >= HIGH_CONFIDENCE_FAQ) {
+    // HIGH CONFIDENCE FAQ, no useful doc support: FAQ alone
     prompt = buildFaqPrompt(question, faqResults, language);
     sourceType = 'faq';
     sources = faqResults.map((f) => ({ name: 'Treelogy FAQ', type: 'faq', category: f.category }));
     allContext = faqResults.map((f) => f.content);
     confidence = Math.min(bestFaqScore / 100, 1);
 
-  } else if (bestFaqScore >= FAQ_RELEVANCE_THRESHOLD && bestDocScore >= VECTOR_SIMILARITY_THRESHOLD) {
+  } else if (bestFaqScore >= FAQ_RELEVANCE_THRESHOLD && bestDocScore >= DOC_SUPPLEMENT_THRESHOLD) {
     // FAQ + Documents: Layered response
     const docContext = documentResults.map((r) => r.content);
     const docSources = documentResults.map((r) => r.metadata);
@@ -190,13 +244,12 @@ async function* processQueryStream(question) {
   yield { type: 'stage', data: { id: 'detect_language', status: 'done' } };
 
   yield { type: 'stage', data: { id: 'search_faq', status: 'active' } };
-  yield { type: 'stage', data: { id: 'search_docs', status: 'active' } };
-  // Run Tier 1 + Tier 2 in parallel
-  const [faqResults, documentResults] = await Promise.all([
-    searchFaq(question, 5),
-    searchSimilar(question, 5),
-  ]);
+  // Run FAQ first so deep-doc search can use its top hits for query expansion
+  const faqResults = await searchFaq(question, 5);
   yield { type: 'stage', data: { id: 'search_faq', status: 'done' } };
+
+  yield { type: 'stage', data: { id: 'search_docs', status: 'active' } };
+  const documentResults = await deepDocumentSearch(question, faqResults);
   yield { type: 'stage', data: { id: 'search_docs', status: 'done' } };
 
   const bestFaqScore = faqResults.length > 0 ? faqResults[0].relevanceScore : 0;
@@ -209,13 +262,24 @@ async function* processQueryStream(question) {
   let sources;
   let confidence;
 
-  if (bestFaqScore >= HIGH_CONFIDENCE_FAQ) {
+  if (bestFaqScore >= HIGH_CONFIDENCE_FAQ && bestDocScore >= DOC_SUPPLEMENT_THRESHOLD) {
+    const docContext = documentResults.map((r) => r.content);
+    const docSources = documentResults.map((r) => r.metadata);
+    prompt = buildLayeredPrompt(question, faqResults, docContext, docSources, language);
+    sourceType = 'faq+documents';
+    sources = [
+      ...faqResults.map((f) => ({ name: 'Treelogy FAQ', type: 'faq', category: f.category })),
+      ...docSources.map((s) => ({ name: s.name, type: 'document' })),
+    ];
+    confidence = Math.max(bestFaqScore / 100, bestDocScore);
+
+  } else if (bestFaqScore >= HIGH_CONFIDENCE_FAQ) {
     prompt = buildFaqPrompt(question, faqResults, language);
     sourceType = 'faq';
     sources = faqResults.map((f) => ({ name: 'Treelogy FAQ', type: 'faq', category: f.category }));
     confidence = Math.min(bestFaqScore / 100, 1);
 
-  } else if (bestFaqScore >= FAQ_RELEVANCE_THRESHOLD && bestDocScore >= VECTOR_SIMILARITY_THRESHOLD) {
+  } else if (bestFaqScore >= FAQ_RELEVANCE_THRESHOLD && bestDocScore >= DOC_SUPPLEMENT_THRESHOLD) {
     const docContext = documentResults.map((r) => r.content);
     const docSources = documentResults.map((r) => r.metadata);
     prompt = buildLayeredPrompt(question, faqResults, docContext, docSources, language);
