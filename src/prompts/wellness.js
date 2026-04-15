@@ -234,6 +234,44 @@ ISSUES: [list any problems found, or "none"]
 CORRECTED_ANSWER: [the corrected answer if issues were found, or "N/A" if verified is true]`;
 }
 
+/**
+ * Build prompt when Shopify product data is available as primary grounding.
+ * Used for product-specific questions (price, stock, variants, benefits, FAQs per product).
+ * Shopify data is authoritative for live commerce facts (price, inventory, variants).
+ */
+function buildShopifyProductPrompt({ question, products, faqResults, documentChunks, documentSources, language }) {
+  const productBlock = products; // already formatted string
+  const faqBlock = (faqResults || [])
+    .map((f, i) => `--- FAQ ${i + 1} [Category: ${f.category}] ---\nQ: ${language === 'id' ? f.question_id : f.question_en}\nA: ${language === 'id' ? f.answer_id : f.answer_en}`)
+    .join('\n\n');
+  const docBlock = (documentChunks || [])
+    .map((chunk, i) => `--- Document ${i + 1} [${documentSources?.[i]?.name || 'Unknown'}] ---\n${chunk}`)
+    .join('\n\n');
+
+  return `${SYSTEM_PROMPT}
+
+KNOWLEDGE SOURCE PRIORITY FOR THIS ANSWER:
+
+=== LAYER 0: LIVE SHOPIFY PRODUCT DATA (AUTHORITATIVE for price, stock, variants, product metafields) ===
+${productBlock}
+
+${faqBlock ? `=== LAYER 1: OFFICIAL TREELOGY FAQ ===\n${faqBlock}\n` : ''}
+${docBlock ? `=== LAYER 2: BRAND DOCUMENTS (SUPPLEMENTARY) ===\n${docBlock}\n` : ''}
+
+USER QUESTION (detected language: ${language}):
+${question}
+
+INSTRUCTIONS:
+1. For LIVE commerce facts (price, availability, stock, SKU, variants, URL) ALWAYS use Shopify data — never guess or infer.
+2. For product benefits / timeline / concerns / product detail / product FAQs, use the metaobject data returned with each product.
+3. Use FAQ + documents to add brand tone, usage guidance, and health context.
+4. NEVER contradict Shopify data with document content.
+5. Respond in ${language === 'id' ? 'Bahasa Indonesia' : 'English'} with Treelogy CS tone and approved emojis only (max 1–2).
+6. If the user asks "berapa harganya?" / "ada stok?" answer precisely from Shopify. If variants differ, list them briefly.
+7. Cite product data as [Source: Shopify – <product title>]. Cite FAQ as [Source: Treelogy FAQ]. Cite documents as [Source: <document name>].
+8. End with a warm CTA (e.g., invite to DM, link to product) per Treelogy tone guidelines.`;
+}
+
 module.exports = {
   SYSTEM_PROMPT,
   buildFaqPrompt,
@@ -241,4 +279,5 @@ module.exports = {
   buildRetrievalPrompt,
   buildFactCheckPrompt,
   buildFallbackPrompt,
+  buildShopifyProductPrompt,
 };

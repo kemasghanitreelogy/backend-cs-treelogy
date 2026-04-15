@@ -3,11 +3,17 @@ const { searchMedical } = require('./tavilySearch');
 const { searchFaq, detectLanguage } = require('./faqKnowledge');
 const { generateResponse, streamResponse } = require('./llm');
 const {
+  searchProducts: searchShopifyProducts,
+  formatProductsForPrompt,
+  isShopifyConfigured,
+} = require('./shopifyProducts');
+const {
   buildFaqPrompt,
   buildLayeredPrompt,
   buildRetrievalPrompt,
   buildFactCheckPrompt,
   buildFallbackPrompt,
+  buildShopifyProductPrompt,
 } = require('../prompts/wellness');
 
 // Thresholds
@@ -168,6 +174,32 @@ async function deepDocumentSearch(question, faqResults = []) {
   return mmrSelect(pool, DEEP_SEARCH_FINAL_K);
 }
 
+// --- Shopify intent detection ---
+const PRODUCT_INTENT_TERMS = [
+  // EN
+  'price','stock','available','variant','sku','buy','order','shipping','product','products','ingredient','ingredients','flavor','flavour','size','bottle','pack',
+  // ID
+  'harga','stok','ready','tersedia','varian','beli','pesan','produk','rasa','kemasan','ukuran','isi','bahan','komposisi','promo','diskon','ongkir',
+];
+
+function hasProductIntent(question) {
+  const q = (question || '').toLowerCase();
+  return PRODUCT_INTENT_TERMS.some((t) => q.includes(t));
+}
+
+async function fetchShopifyProducts(question) {
+  if (!isShopifyConfigured()) return [];
+  const keywords = extractKeywords(question);
+  // Always try if product intent is detected, OR if the question is short (likely product-focused)
+  if (!hasProductIntent(question) && keywords.length > 6) return [];
+  try {
+    return await searchShopifyProducts(keywords, { first: 5 });
+  } catch (err) {
+    console.warn('[ragOrchestrator] Shopify fetch failed:', err.message);
+    return [];
+  }
+}
+
 const MEDICAL_DISCLAIMER_ID = `\n\n---\n**Disclaimer:** Informasi ini diberikan hanya untuk tujuan edukasi dan kesehatan umum, bukan merupakan saran medis. Selalu konsultasikan dengan tenaga kesehatan profesional sebelum mengambil keputusan kesehatan. Treelogy tidak mendiagnosis, mengobati, atau menyembuhkan kondisi medis apa pun.`;
 const MEDICAL_DISCLAIMER_EN = `\n\n---\n**Disclaimer:** This information is provided for educational and wellness purposes only and does not constitute medical advice. Always consult a qualified healthcare professional before making health decisions. Treelogy does not diagnose, treat, or cure any medical condition.`;
 
@@ -189,8 +221,11 @@ async function processQuery(question) {
   const language = detectLanguage(question);
   const disclaimer = language === 'id' ? MEDICAL_DISCLAIMER_ID : MEDICAL_DISCLAIMER_EN;
 
-  // === TIER 1: FAQ Search ===
-  const faqResults = await searchFaq(question, 5);
+  // === TIER 1 + 1.5: FAQ + Shopify (parallel) ===
+  const [faqResults, shopifyProducts] = await Promise.all([
+    searchFaq(question, 5),
+    fetchShopifyProducts(question),
+  ]);
   const bestFaqScore = faqResults.length > 0 ? faqResults[0].relevanceScore : 0;
 
   // === TIER 2: Deep Document Retrieval (query-expanded, deduped, re-ranked) ===
@@ -203,10 +238,32 @@ async function processQuery(question) {
   let allContext;
   let confidence;
 
-  // --- Decision Logic ---
-  // Always layer uploaded documents AFTER FAQ when they clear the supplement bar.
+  // === TIER 1.5 FIRST: if Shopify returned products, they are authoritative for commerce facts ===
+  if (shopifyProducts.length > 0) {
+    const docContext = documentResults.map((r) => r.content);
+    const docSources = documentResults.map((r) => r.metadata);
+    prompt = buildShopifyProductPrompt({
+      question,
+      products: formatProductsForPrompt(shopifyProducts),
+      faqResults,
+      documentChunks: docContext,
+      documentSources: docSources,
+      language,
+    });
+    sourceType = 'shopify+faq+documents';
+    sources = [
+      ...shopifyProducts.map((p) => ({ name: `Shopify – ${p.title}`, type: 'shopify', url: p.url, handle: p.handle })),
+      ...faqResults.map((f) => ({ name: 'Treelogy FAQ', type: 'faq', category: f.category })),
+      ...docSources.map((s) => ({ name: s.name, type: 'document', path: s.path })),
+    ];
+    allContext = [
+      ...shopifyProducts.map((p) => `${p.title}\n${p.description || ''}`),
+      ...faqResults.map((f) => f.content),
+      ...docContext,
+    ];
+    confidence = Math.max(0.85, bestFaqScore / 100, bestDocScore);
 
-  if (bestFaqScore >= HIGH_CONFIDENCE_FAQ && bestDocScore >= DOC_SUPPLEMENT_THRESHOLD) {
+  } else if (bestFaqScore >= HIGH_CONFIDENCE_FAQ && bestDocScore >= DOC_SUPPLEMENT_THRESHOLD) {
     // HIGH CONFIDENCE FAQ + supporting docs: layered depth
     const docContext = documentResults.map((r) => r.content);
     const docSources = documentResults.map((r) => r.metadata);
@@ -344,6 +401,7 @@ async function* processQueryStream(question) {
   const stagePlan = [
     { id: 'detect_language', label_en: 'Detecting language', label_id: 'Mendeteksi bahasa' },
     { id: 'search_faq', label_en: 'Searching FAQ knowledge base', label_id: 'Mencari basis pengetahuan FAQ' },
+    { id: 'search_shopify', label_en: 'Looking up live Shopify product data', label_id: 'Mengambil data produk Shopify' },
     { id: 'search_docs', label_en: 'Searching trusted documents', label_id: 'Mencari dokumen terpercaya' },
     { id: 'route', label_en: 'Selecting best answer strategy', label_id: 'Memilih strategi jawaban terbaik' },
     { id: 'generate', label_en: 'Generating answer', label_id: 'Menyusun jawaban' },
@@ -357,9 +415,14 @@ async function* processQueryStream(question) {
   yield { type: 'stage', data: { id: 'detect_language', status: 'done' } };
 
   yield { type: 'stage', data: { id: 'search_faq', status: 'active' } };
-  // Run FAQ first so deep-doc search can use its top hits for query expansion
-  const faqResults = await searchFaq(question, 5);
+  yield { type: 'stage', data: { id: 'search_shopify', status: 'active' } };
+  // FAQ + Shopify in parallel
+  const [faqResults, shopifyProducts] = await Promise.all([
+    searchFaq(question, 5),
+    fetchShopifyProducts(question),
+  ]);
   yield { type: 'stage', data: { id: 'search_faq', status: 'done' } };
+  yield { type: 'stage', data: { id: 'search_shopify', status: 'done' } };
 
   yield { type: 'stage', data: { id: 'search_docs', status: 'active' } };
   const documentResults = await deepDocumentSearch(question, faqResults);
@@ -375,7 +438,26 @@ async function* processQueryStream(question) {
   let sources;
   let confidence;
 
-  if (bestFaqScore >= HIGH_CONFIDENCE_FAQ && bestDocScore >= DOC_SUPPLEMENT_THRESHOLD) {
+  if (shopifyProducts.length > 0) {
+    const docContext = documentResults.map((r) => r.content);
+    const docSources = documentResults.map((r) => r.metadata);
+    prompt = buildShopifyProductPrompt({
+      question,
+      products: formatProductsForPrompt(shopifyProducts),
+      faqResults,
+      documentChunks: docContext,
+      documentSources: docSources,
+      language,
+    });
+    sourceType = 'shopify+faq+documents';
+    sources = [
+      ...shopifyProducts.map((p) => ({ name: `Shopify – ${p.title}`, type: 'shopify', url: p.url })),
+      ...faqResults.map((f) => ({ name: 'Treelogy FAQ', type: 'faq', category: f.category })),
+      ...docSources.map((s) => ({ name: s.name, type: 'document' })),
+    ];
+    confidence = Math.max(0.85, bestFaqScore / 100, bestDocScore);
+
+  } else if (bestFaqScore >= HIGH_CONFIDENCE_FAQ && bestDocScore >= DOC_SUPPLEMENT_THRESHOLD) {
     const docContext = documentResults.map((r) => r.content);
     const docSources = documentResults.map((r) => r.metadata);
     prompt = buildLayeredPrompt(question, faqResults, docContext, docSources, language);

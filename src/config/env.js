@@ -30,6 +30,11 @@ module.exports = {
   tavily: {
     apiKey: process.env.TAVILY_API_KEY,
   },
+  shopify: {
+    shopDomain: process.env.SHOPIFY_SHOP_DOMAIN || '',
+    adminToken: process.env.SHOPIFY_ADMIN_TOKEN || '',
+    apiVersion: process.env.SHOPIFY_API_VERSION || '2025-01',
+  },
   redis: {
     url: process.env.REDIS_URL || 'redis://localhost:6379',
   },
