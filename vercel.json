@@ -1,6 +1,7 @@
 {
   "version": 2,
   "rewrites": [
-    { "source": "/(.*)", "destination": "/api" }
+    { "source": "/api/query/stream", "destination": "/api/query/stream" },
+    { "source": "/((?!api/).*)", "destination": "/api" }
   ]
 }
