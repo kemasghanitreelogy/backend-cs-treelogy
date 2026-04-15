@@ -1,5 +1,200 @@
 const { shopifyGraphql, isConfigured } = require('./shopifyClient');
 
+// --- Smart nested-reference resolver ---
+
+const GID_PATTERN = /^gid:\/\/shopify\/([A-Za-z]+)\/\d+$/;
+const MAX_RESOLVE_DEPTH = 6;
+const MAX_RESOLVE_IDS_PER_BATCH = 150; // Shopify hard limit is 250; stay conservative
+
+const NODES_QUERY = /* GraphQL */ `
+  query ResolveNodes($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      __typename
+      ... on Metaobject {
+        id
+        type
+        handle
+        fields { key value type }
+      }
+      ... on MediaImage {
+        id
+        image { url altText width height }
+      }
+      ... on Video {
+        id
+        sources { url mimeType }
+        preview { image { url } }
+      }
+      ... on GenericFile {
+        id
+        url
+        mimeType
+      }
+      ... on Product {
+        id
+        title
+        handle
+      }
+      ... on ProductVariant {
+        id
+        title
+        sku
+        price
+      }
+    }
+  }
+`;
+
+function isGid(value) {
+  return typeof value === 'string' && GID_PATTERN.test(value);
+}
+
+/**
+ * Walk any nested structure and collect every unresolved GID string.
+ * Skips GIDs already present in the resolved cache.
+ */
+function collectGids(node, acc, cache) {
+  if (node == null) return;
+  if (typeof node === 'string') {
+    if (isGid(node) && !cache.has(node)) acc.add(node);
+    return;
+  }
+  if (Array.isArray(node)) {
+    node.forEach((v) => collectGids(v, acc, cache));
+    return;
+  }
+  if (typeof node === 'object') {
+    // Skip already-resolved metaobject bodies (they have __resolved marker)
+    if (node.__resolved) return;
+    for (const v of Object.values(node)) collectGids(v, acc, cache);
+  }
+}
+
+/**
+ * Replace every GID string in-place with its resolved object from the cache.
+ * Leaves strings that didn't resolve untouched.
+ */
+function substituteGids(node, cache) {
+  if (node == null) return node;
+  if (typeof node === 'string') {
+    if (isGid(node) && cache.has(node)) return cache.get(node);
+    return node;
+  }
+  if (Array.isArray(node)) {
+    return node.map((v) => substituteGids(v, cache));
+  }
+  if (typeof node === 'object') {
+    if (node.__resolved) return node;
+    const out = {};
+    for (const [k, v] of Object.entries(node)) out[k] = substituteGids(v, cache);
+    return out;
+  }
+  return node;
+}
+
+/**
+ * Convert a Shopify Node into a plain, LLM-friendly object.
+ */
+function shapeResolvedNode(n) {
+  if (!n) return null;
+  switch (n.__typename) {
+    case 'Metaobject': {
+      const obj = { __resolved: true, __kind: 'metaobject', type: n.type, handle: n.handle };
+      for (const f of n.fields || []) {
+        obj[f.key] = parseMetaobjectValue(f);
+      }
+      return obj;
+    }
+    case 'MediaImage':
+      return { __resolved: true, __kind: 'image', url: n.image?.url, alt: n.image?.altText };
+    case 'Video':
+      return { __resolved: true, __kind: 'video', url: n.sources?.[0]?.url, poster: n.preview?.image?.url };
+    case 'GenericFile':
+      return { __resolved: true, __kind: 'file', url: n.url, mimeType: n.mimeType };
+    case 'Product':
+      return { __resolved: true, __kind: 'product', title: n.title, handle: n.handle };
+    case 'ProductVariant':
+      return { __resolved: true, __kind: 'variant', title: n.title, sku: n.sku, price: n.price };
+    default:
+      return { __resolved: true, __kind: (n.__typename || 'unknown').toLowerCase(), id: n.id };
+  }
+}
+
+/**
+ * Smart recursive resolver:
+ *   1. Walk the tree, collect every unresolved GID.
+ *   2. Batch-fetch via `nodes(ids:)`.
+ *   3. Cache + substitute.
+ *   4. Repeat until no new GIDs are found OR depth cap reached.
+ *
+ * Uses a shared cache across a whole product list so we never re-fetch.
+ */
+async function resolveAllReferences(root, cache = new Map()) {
+  let current = root;
+  for (let depth = 0; depth < MAX_RESOLVE_DEPTH; depth++) {
+    const gids = new Set();
+    collectGids(current, gids, cache);
+    if (gids.size === 0) break;
+
+    const ids = [...gids];
+    for (let i = 0; i < ids.length; i += MAX_RESOLVE_IDS_PER_BATCH) {
+      const batch = ids.slice(i, i + MAX_RESOLVE_IDS_PER_BATCH);
+      try {
+        const data = await shopifyGraphql(NODES_QUERY, { ids: batch });
+        (data?.nodes || []).forEach((n) => {
+          if (!n?.id) return;
+          cache.set(n.id, shapeResolvedNode(n));
+        });
+      } catch (err) {
+        // Mark failed ids so we stop retrying them
+        batch.forEach((id) => cache.set(id, { __resolved: true, __kind: 'unresolved', id }));
+      }
+    }
+
+    current = substituteGids(current, cache);
+  }
+  return current;
+}
+
+// --- Rich-text flattener (Shopify "rich_text_field" stores nested JSON) ---
+
+function flattenRichText(value) {
+  if (!value) return '';
+  let node = value;
+  if (typeof value === 'string') {
+    try { node = JSON.parse(value); } catch { return value; }
+  }
+  const parts = [];
+  const walk = (n) => {
+    if (!n) return;
+    if (Array.isArray(n)) { n.forEach(walk); return; }
+    if (typeof n === 'string') { parts.push(n); return; }
+    if (n.type === 'text' && typeof n.value === 'string') parts.push(n.value);
+    if (Array.isArray(n.children)) n.children.forEach(walk);
+  };
+  walk(node);
+  return parts.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Post-process a resolved tree to flatten any `description` / `value`
+ * fields that contain rich-text JSON. Leaves everything else untouched.
+ */
+function flattenRichTextFields(node) {
+  if (node == null) return node;
+  if (Array.isArray(node)) return node.map(flattenRichTextFields);
+  if (typeof node !== 'object') return node;
+  const out = {};
+  for (const [k, v] of Object.entries(node)) {
+    if (typeof v === 'string' && v.startsWith('{"type":"root"')) {
+      out[k] = flattenRichText(v);
+    } else {
+      out[k] = flattenRichTextFields(v);
+    }
+  }
+  return out;
+}
+
 /**
  * Shopify product knowledge service for Treelogy.
  *
@@ -67,32 +262,16 @@ const PRODUCT_SEARCH_QUERY = /* GraphQL */ `
           concernsRef: metafield(namespace: "custom", key: "concerns") {
             type
             value
-            references(first: 20) {
-              edges {
-                node {
-                  ... on Metaobject {
-                    id
-                    type
-                    handle
-                    fields { key value type }
-                  }
-                }
-              }
-            }
           }
           faqRef: metafield(namespace: "product", key: "faq") {
             type
             value
-            references(first: 30) {
-              edges {
-                node {
-                  ... on Metaobject {
-                    id
-                    type
-                    handle
-                    fields { key value type }
-                  }
-                }
+            reference {
+              ... on Metaobject {
+                id
+                type
+                handle
+                fields { key value type }
               }
             }
           }
@@ -161,6 +340,30 @@ function flattenRefs(metafield) {
 }
 
 /**
+ * Handle a single metaobject_reference (not list).
+ * Returns [] or [metaobject] for consistency with flattenRefs.
+ */
+function singleRef(metafield) {
+  if (!metafield?.reference) return [];
+  const obj = formatMetaobject(metafield.reference);
+  return obj ? [obj] : [];
+}
+
+/**
+ * Handle list.single_line_text_field (just strings, no metaobject).
+ * Returns a plain array of strings.
+ */
+function parseStringList(metafield) {
+  if (!metafield?.value) return [];
+  try {
+    const parsed = JSON.parse(metafield.value);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    return [metafield.value];
+  }
+}
+
+/**
  * Build a Shopify search query string from user keywords.
  * Uses Shopify's `query` syntax (https://shopify.dev/api/usage/search-syntax).
  */
@@ -195,7 +398,15 @@ async function searchProducts(keywords, { first = 5 } = {}) {
 
   try {
     const data = await shopifyGraphql(PRODUCT_SEARCH_QUERY, { query, first });
-    return (data?.products?.edges || []).map(({ node }) => normalizeProduct(node));
+    const products = (data?.products?.edges || []).map(({ node }) => normalizeProduct(node));
+
+    // Smart recursive resolution — follow every nested GID (FAQ items, icons, etc.)
+    // until fully materialized. One shared cache across all products.
+    const cache = new Map();
+    const resolved = await resolveAllReferences(products, cache);
+
+    // Flatten rich-text JSON blobs into plain text so the LLM can read them directly.
+    return flattenRichTextFields(resolved);
   } catch (err) {
     console.warn('[shopifyProducts] search failed:', err.message);
     return [];
@@ -236,8 +447,8 @@ function normalizeProduct(node) {
     totalInventory: node.totalInventory,
     variants,
     timeline: flattenRefs(node.timelineRef),             // metaobject timeline_benefit[]
-    concerns: flattenRefs(node.concernsRef),             // metaobject concerns[]
-    faqs: flattenRefs(node.faqRef),                      // metaobject faq_group[]
+    concerns: parseStringList(node.concernsRef),         // list of plain strings
+    faqs: singleRef(node.faqRef),                        // single metaobject faq_group
     productDetails: flattenRefs(node.productDetailRef),  // metaobject product_detail_list[]
   };
 }
