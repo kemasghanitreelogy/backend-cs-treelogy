@@ -88,14 +88,17 @@ async function storeChunks(chunks, documentId) {
 /**
  * Semantic search: find the most relevant chunks for a query.
  * Uses pgvector's cosine similarity via the match_knowledge_chunks RPC.
+ *
+ * Threshold is relaxed at DB level (0.30) so the orchestrator can apply
+ * hybrid re-ranking (keyword + MMR) on a broader candidate pool.
  */
 async function searchSimilar(query, topK = 5) {
   const queryEmbedding = await generateEmbedding(query);
 
   const { data, error } = await supabase.rpc('match_knowledge_chunks', {
     query_embedding: queryEmbedding,
-    match_threshold: 0.5,
-    match_count: topK,
+    match_threshold: 0.30,
+    match_count: Math.max(topK * 3, 15),
   });
 
   if (error) throw new Error(`Vector search failed: ${error.message}`);
@@ -107,6 +110,42 @@ async function searchSimilar(query, topK = 5) {
     pageNumber: row.page_number,
     sectionTitle: row.section_title,
     documentId: row.document_id,
+  }));
+}
+
+/**
+ * Keyword search: ILIKE-based fallback for exact-term matches
+ * (product names, ingredient names, SKUs, Indonesian-specific terms)
+ * that pure vector similarity can miss.
+ */
+async function keywordSearch(keywords, topK = 10) {
+  if (!keywords || keywords.length === 0) return [];
+
+  // Build an OR filter of ILIKE patterns
+  const orFilter = keywords
+    .filter((k) => k && k.length >= 3)
+    .slice(0, 8)
+    .map((k) => `content.ilike.%${k.replace(/[%_,]/g, ' ')}%`)
+    .join(',');
+
+  if (!orFilter) return [];
+
+  const { data, error } = await supabase
+    .from('knowledge_chunks')
+    .select('content, metadata, page_number, section_title, document_id')
+    .or(orFilter)
+    .limit(topK);
+
+  if (error) return [];
+
+  return (data || []).map((row) => ({
+    content: row.content,
+    similarity: 0, // unknown — orchestrator will score by keyword overlap
+    metadata: row.metadata,
+    pageNumber: row.page_number,
+    sectionTitle: row.section_title,
+    documentId: row.document_id,
+    keywordHit: true,
   }));
 }
 
@@ -162,6 +201,7 @@ module.exports = {
   findDocumentByHash,
   storeChunks,
   searchSimilar,
+  keywordSearch,
   listDocuments,
   deleteDocument,
   clearStore,

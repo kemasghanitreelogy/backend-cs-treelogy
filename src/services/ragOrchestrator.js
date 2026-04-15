@@ -1,4 +1,4 @@
-const { searchSimilar } = require('./vectorStore');
+const { searchSimilar, keywordSearch } = require('./vectorStore');
 const { searchMedical } = require('./tavilySearch');
 const { searchFaq, detectLanguage } = require('./faqKnowledge');
 const { generateResponse, streamResponse } = require('./llm');
@@ -12,47 +12,160 @@ const {
 
 // Thresholds
 const FAQ_RELEVANCE_THRESHOLD = 15;          // Minimum FAQ relevance score to be considered a match
-const VECTOR_SIMILARITY_THRESHOLD = 0.62;    // Hard floor for docs-only answers
-const DOC_SUPPLEMENT_THRESHOLD = 0.50;       // Looser floor for docs used as supplement to FAQ
+const VECTOR_SIMILARITY_THRESHOLD = 0.55;    // Hard floor for docs-only answers (post-hybrid-rerank)
+const DOC_SUPPLEMENT_THRESHOLD = 0.38;       // Looser floor for docs used as supplement to FAQ
 const HIGH_CONFIDENCE_FAQ = 30;              // FAQ score above this = very confident match
 const DEEP_SEARCH_TOP_K = 8;                 // Per-query top-k for document retrieval
 const DEEP_SEARCH_FINAL_K = 6;               // Final chunks after dedupe + rerank
 
+// --- Tokenization & scoring helpers ---
+
+const STOPWORDS = new Set([
+  // EN
+  'the','a','an','is','are','was','were','be','been','being','of','to','in','on','for','and','or','but','at','by','with','from','as','it','this','that','these','those','i','you','we','they','he','she','do','does','did','not','no','yes','can','could','should','would','will','has','have','had','about','what','which','who','when','where','why','how',
+  // ID
+  'yang','dan','atau','di','ke','dari','untuk','pada','dengan','adalah','itu','ini','saya','kamu','kita','mereka','dia','apa','bagaimana','mengapa','kapan','dimana','siapa','bisa','bisakah','boleh','tidak','bukan','ya','sudah','belum','akan','sedang','agar','supaya','jadi','tapi','tetapi','juga','saja','kalau','jika','kenapa','ada','apakah',
+]);
+
+function tokenize(text) {
+  return (text || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter((t) => t.length >= 3 && !STOPWORDS.has(t));
+}
+
+function extractKeywords(question) {
+  const tokens = tokenize(question);
+  // Dedupe while preserving order
+  return [...new Set(tokens)];
+}
+
+function keywordOverlapScore(queryTokens, chunkText) {
+  if (queryTokens.length === 0) return 0;
+  const chunkTokens = new Set(tokenize(chunkText));
+  let hits = 0;
+  for (const t of queryTokens) if (chunkTokens.has(t)) hits += 1;
+  return hits / queryTokens.length;
+}
+
 /**
- * Deep document search:
- *  - Runs the original question
- *  - Plus rewrites derived from top FAQ hits (expands vocabulary the uploaded docs may use)
- *  - Merges, dedupes by content hash, and keeps the highest-similarity chunks
+ * Reciprocal Rank Fusion: merge multiple ranked lists into a single robust ranking.
+ */
+function reciprocalRankFusion(rankedLists, k = 60) {
+  const scores = new Map();
+  const items = new Map();
+
+  for (const list of rankedLists) {
+    list.forEach((item, rank) => {
+      const key = (item.content || '').slice(0, 200);
+      const prev = scores.get(key) || 0;
+      scores.set(key, prev + 1 / (k + rank + 1));
+      // Keep the variant with the highest known similarity
+      const existing = items.get(key);
+      if (!existing || (item.similarity || 0) > (existing.similarity || 0)) {
+        items.set(key, item);
+      }
+    });
+  }
+
+  return [...items.entries()]
+    .map(([key, item]) => ({ item, rrfScore: scores.get(key) }))
+    .sort((a, b) => b.rrfScore - a.rrfScore)
+    .map((x) => ({ ...x.item, rrfScore: x.rrfScore }));
+}
+
+/**
+ * Maximal Marginal Relevance — diversify the final set so near-duplicate chunks
+ * (common in uploaded docs with repeated sections) don't crowd out fresh info.
+ */
+function mmrSelect(candidates, finalK, lambda = 0.72) {
+  const selected = [];
+  const remaining = [...candidates];
+
+  while (selected.length < finalK && remaining.length > 0) {
+    let bestIdx = 0;
+    let bestScore = -Infinity;
+
+    for (let i = 0; i < remaining.length; i++) {
+      const cand = remaining[i];
+      const relevance = cand._combinedScore ?? cand.similarity ?? cand.rrfScore ?? 0;
+
+      let maxSimToSelected = 0;
+      const candTokens = new Set(tokenize(cand.content));
+      for (const sel of selected) {
+        const selTokens = new Set(tokenize(sel.content));
+        const inter = [...candTokens].filter((t) => selTokens.has(t)).length;
+        const union = new Set([...candTokens, ...selTokens]).size || 1;
+        const jaccard = inter / union;
+        if (jaccard > maxSimToSelected) maxSimToSelected = jaccard;
+      }
+
+      const score = lambda * relevance - (1 - lambda) * maxSimToSelected;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+
+    selected.push(remaining.splice(bestIdx, 1)[0]);
+  }
+
+  return selected;
+}
+
+/**
+ * S+ grade deep document search:
+ *   1. Multi-query vector search (question + FAQ reformulations)
+ *   2. Keyword ILIKE search for exact-term matches (product names, ingredients, SKUs)
+ *   3. RRF fusion across all ranked lists
+ *   4. Keyword-overlap boost (hybrid scoring)
+ *   5. MMR diversification so the final set covers different facets
  *
- * This surfaces uploaded-file knowledge that a single-query search would miss.
+ * This recovers document knowledge that single-query pure-vector search misses,
+ * especially for Indonesian casual phrasing vs. formal document text.
  */
 async function deepDocumentSearch(question, faqResults = []) {
   const queries = new Set([question]);
-
-  // Expand with the top-2 FAQ questions (proven relevant phrasings)
   faqResults.slice(0, 2).forEach((f) => {
     if (f.question_id) queries.add(f.question_id);
     if (f.question_en) queries.add(f.question_en);
   });
 
-  const searches = await Promise.all(
-    [...queries].map((q) => searchSimilar(q, DEEP_SEARCH_TOP_K).catch(() => []))
+  const keywords = extractKeywords(question);
+
+  const [vectorBatches, keywordHits] = await Promise.all([
+    Promise.all(
+      [...queries].map((q) => searchSimilar(q, DEEP_SEARCH_TOP_K).catch(() => []))
+    ),
+    keywordSearch(keywords, 12).catch(() => []),
+  ]);
+
+  // Sort each vector batch by similarity before RRF
+  const sortedVectorLists = vectorBatches.map((b) =>
+    [...b].sort((a, b2) => b2.similarity - a.similarity)
   );
 
-  const byKey = new Map();
-  for (const batch of searches) {
-    for (const hit of batch) {
-      const key = (hit.content || '').slice(0, 200);
-      const existing = byKey.get(key);
-      if (!existing || hit.similarity > existing.similarity) {
-        byKey.set(key, hit);
-      }
-    }
-  }
+  const fused = reciprocalRankFusion([...sortedVectorLists, keywordHits]);
 
-  return [...byKey.values()]
-    .sort((a, b) => b.similarity - a.similarity)
-    .slice(0, DEEP_SEARCH_FINAL_K);
+  // Hybrid score: RRF + keyword overlap + raw similarity
+  const queryTokens = keywords;
+  const scored = fused.map((c) => {
+    const overlap = keywordOverlapScore(queryTokens, c.content);
+    const sim = c.similarity || 0;
+    const rrf = c.rrfScore || 0;
+    return {
+      ...c,
+      similarity: Math.max(sim, overlap * 0.9), // lift keyword-only hits
+      _combinedScore: 0.55 * sim + 0.25 * overlap + 0.20 * rrf,
+    };
+  });
+
+  scored.sort((a, b) => b._combinedScore - a._combinedScore);
+
+  // Keep a generous candidate pool then MMR down to final K
+  const pool = scored.slice(0, DEEP_SEARCH_FINAL_K * 3);
+  return mmrSelect(pool, DEEP_SEARCH_FINAL_K);
 }
 
 const MEDICAL_DISCLAIMER_ID = `\n\n---\n**Disclaimer:** Informasi ini diberikan hanya untuk tujuan edukasi dan kesehatan umum, bukan merupakan saran medis. Selalu konsultasikan dengan tenaga kesehatan profesional sebelum mengambil keputusan kesehatan. Treelogy tidak mendiagnosis, mengobati, atau menyembuhkan kondisi medis apa pun.`;
