@@ -54,17 +54,24 @@ async function handleStreamQuery(req, res) {
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
+    'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
+  // Disable Nagle + force headers out immediately so the first stage event reaches the client.
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  if (res.socket && typeof res.socket.setNoDelay === 'function') res.socket.setNoDelay(true);
 
   try {
     const stream = processQueryStream(question);
 
+    // Priming comment — forces some proxies/CDNs to open the stream.
+    res.write(`: ok\n\n`);
+
     for await (const event of stream) {
       res.write(`event: ${event.type}\n`);
       res.write(`data: ${JSON.stringify(event.data)}\n\n`);
+      if (typeof res.flush === 'function') res.flush();
     }
   } catch (err) {
     console.error('[StreamController] Error:', err);
