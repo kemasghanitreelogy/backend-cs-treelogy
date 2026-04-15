@@ -43,11 +43,14 @@ async function handler(req, res) {
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
+    'Content-Encoding': 'identity',
   });
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
   if (res.socket && typeof res.socket.setNoDelay === 'function') res.socket.setNoDelay(true);
 
-  // Prime the stream so any intermediary proxy releases headers immediately.
+  // 2KB padding comment forces Vercel/proxy/browser to release the response body buffer
+  // immediately instead of waiting for ~4KB-8KB to accumulate.
+  res.write(`: ${' '.repeat(2048)}\n\n`);
   res.write(`: connected\n\n`);
 
   // Heartbeat keeps the connection warm (and flushes any buffered bytes).
