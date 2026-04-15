@@ -173,17 +173,36 @@ async function processQuery(question) {
  * Streaming version of the 3-tier RAG pipeline.
  */
 async function* processQueryStream(question) {
+  // Announce the full pipeline plan up-front so the UI can render the layer list.
+  const stagePlan = [
+    { id: 'detect_language', label_en: 'Detecting language', label_id: 'Mendeteksi bahasa' },
+    { id: 'search_faq', label_en: 'Searching FAQ knowledge base', label_id: 'Mencari basis pengetahuan FAQ' },
+    { id: 'search_docs', label_en: 'Searching trusted documents', label_id: 'Mencari dokumen terpercaya' },
+    { id: 'route', label_en: 'Selecting best answer strategy', label_id: 'Memilih strategi jawaban terbaik' },
+    { id: 'generate', label_en: 'Generating answer', label_id: 'Menyusun jawaban' },
+    { id: 'finalize', label_en: 'Finalizing & attaching sources', label_id: 'Menyelesaikan & melampirkan sumber' },
+  ];
+  yield { type: 'stages', data: stagePlan };
+
+  yield { type: 'stage', data: { id: 'detect_language', status: 'active' } };
   const language = detectLanguage(question);
   const disclaimer = language === 'id' ? MEDICAL_DISCLAIMER_ID : MEDICAL_DISCLAIMER_EN;
+  yield { type: 'stage', data: { id: 'detect_language', status: 'done' } };
 
+  yield { type: 'stage', data: { id: 'search_faq', status: 'active' } };
+  yield { type: 'stage', data: { id: 'search_docs', status: 'active' } };
   // Run Tier 1 + Tier 2 in parallel
   const [faqResults, documentResults] = await Promise.all([
     searchFaq(question, 5),
     searchSimilar(question, 5),
   ]);
+  yield { type: 'stage', data: { id: 'search_faq', status: 'done' } };
+  yield { type: 'stage', data: { id: 'search_docs', status: 'done' } };
 
   const bestFaqScore = faqResults.length > 0 ? faqResults[0].relevanceScore : 0;
   const bestDocScore = documentResults.length > 0 ? documentResults[0].similarity : 0;
+
+  yield { type: 'stage', data: { id: 'route', status: 'active' } };
 
   let prompt;
   let sourceType;
@@ -222,7 +241,20 @@ async function* processQueryStream(question) {
     confidence = bestDocScore;
 
   } else {
+    // Insert a web-search stage into the plan now that we know we need it.
+    yield {
+      type: 'stage',
+      data: {
+        id: 'search_web',
+        status: 'active',
+        insertAfter: 'search_docs',
+        label_en: 'Searching trusted medical sources on the web',
+        label_id: 'Mencari sumber medis terpercaya di web',
+      },
+    };
     const webResults = await searchMedical(question);
+    yield { type: 'stage', data: { id: 'search_web', status: 'done' } };
+
     if (webResults.length === 0 && faqResults.length === 0 && documentResults.length === 0) {
       yield {
         type: 'error',
@@ -247,17 +279,22 @@ async function* processQueryStream(question) {
     confidence = Math.max(bestFaqScore / 100, bestDocScore, webResults[0]?.score || 0);
   }
 
+  yield { type: 'stage', data: { id: 'route', status: 'done' } };
+
   // Emit metadata
   yield {
     type: 'metadata',
     data: { sourceType, confidence, language, sourceCount: sources.length },
   };
 
+  yield { type: 'stage', data: { id: 'generate', status: 'active' } };
   // Stream the answer
   for await (const token of streamResponse(prompt)) {
     yield { type: 'token', data: token };
   }
+  yield { type: 'stage', data: { id: 'generate', status: 'done' } };
 
+  yield { type: 'stage', data: { id: 'finalize', status: 'active' } };
   // Emit sources and disclaimer
   yield {
     type: 'sources',
@@ -269,6 +306,7 @@ async function* processQueryStream(question) {
   };
 
   yield { type: 'disclaimer', data: disclaimer };
+  yield { type: 'stage', data: { id: 'finalize', status: 'done' } };
   yield { type: 'done', data: null };
 }
 
