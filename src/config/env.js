@@ -21,7 +21,7 @@ module.exports = {
   nodeEnv: process.env.NODE_ENV || 'development',
   hf: {
     apiToken: process.env.HF_API_TOKEN,
-    modelId: process.env.HF_MODEL_ID || 'mistralai/Mistral-Large-Instruct-2407',
+    modelId: process.env.HF_MODEL_ID || 'meta-llama/Llama-3.1-8B-Instruct',
   },
   supabase: {
     url: process.env.SUPABASE_URL,
